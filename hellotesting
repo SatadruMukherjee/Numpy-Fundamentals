@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
+import boto3
+import traceback
+import datetime
+from datetime import date
+from distutils.util import strtobool
+
+def lambda_handler(event, context):
+  responseData = {
+    "status": "success"
+  }
+
+  try:
+
+    # Calculating Current Date 
+    today = date.today()
+    # Month abbreviation, day and year	
+    d4 = today.strftime("%b-%d-%Y")
+
+    recieve_queue_url         = event["input_queue_url"]                # Input SQS URL
+    send_queue_url            = event["output_queue_url"]               # Output Queue URL
+    max_retries               = int(event["max_retries"])               # Maximum Number of attempts to transfer messages from Input SQS to Output SQS before finally deleting it from Input SQS 
+    s3_bucket                 = event["s3_bucket_name"]                 # Name of S3 bucket to put messages before finally deleting from Input SQS
+    s3_prefix_stage           = event["s3_prefix_path"]                 # Complete path of S3 prefix to store the deleted messages 
+                                                                        # example : "dev/prop/dlq/deleteMessages"
+    # fetching AWS Region of SQS Queue from its URL
+    recieve_region            = recieve_queue_url.split('.')[1]         
+    send_region               = send_queue_url.split('.')[1]
+
+    sqs_recieve               = boto3.client('sqs', region_name=recieve_region)
+    sqs_send                  = boto3.client('sqs', region_name=send_region)
+    s3                        = boto3.client('s3')
+
+    # Defining Custom Function to Send Message to Main Queue and Deleting it from DLQ 
+    def sendAndDeleteQueue(sendQueueUrl,messageBody,messageAttributes,recieveQueueUrl,receiptHandle) :
+        
+        # Calling Send Message API
+        ret = sqs_send.send_message( QueueUrl=sendQueueUrl, 
+                                MessageBody=messageBody,
+                                MessageAttributes=messageAttributes) 
+                                
+        # Calling Delete Message API 
+        sqs_recieve.delete_message(QueueUrl=recieveQueueUrl, ReceiptHandle=receiptHandle)
+
+    for count in range(10) :
+        messages = sqs_recieve.receive_message(QueueUrl=recieve_queue_url, MaxNumberOfMessages=10
+                                       ,WaitTimeSeconds=5,MessageAttributeNames=['All'])
+            
+        if 'Messages' in messages:
+            for m in messages['Messages']:
+
+                new_MessageAttributes = {}                      # Declaring empty Dictonary 
+                retryCount = 1                                  # Setting retry Counter as 1 since it is a New message. 
+
+                if 'MessageAttributes' in m :                   # Checking whether Message Attributes exists in Original Message 
+                    new_MessageAttributes = m['MessageAttributes']
+
+                    # Checking Whether retryCount Attribute Existing or Not. If Existing then it is reprocessed message else it is New message. 
+                    if 'retryCount' in m['MessageAttributes'] :
+                        retryCount = int(m['MessageAttributes']['retryCount']['StringValue']) + 1               # Incrementing retry Counter. 
+                
+                new_MessageAttributes['retryCount'] = {'DataType': 'Number','StringValue': str(retryCount)}     # Appending retryCount attribute to existing attributes.
+
+                if retryCount <= max_retries :
+                    sendAndDeleteQueue(send_queue_url,m['Body'],new_MessageAttributes,recieve_queue_url,m['ReceiptHandle'])
+                else :
+
+                    # Need to Store Message in S3 Bucket before finally deleting the message from recieve Queue
+                    ct = datetime.datetime.now().timestamp()              # Calculating Current Timestamp 
+                    s3_key = s3_prefix_stage+"/"+d4+"_"+str(ct)+"_"+m['MessageId']+".json"
+
+                    s3.put_object(Body=m['Body'],
+                                  Bucket=s3_bucket, 
+                                  Key=s3_key)
+                    # Deleting the message from recieve queue. 
+                    sqs_recieve.delete_message(QueueUrl=recieve_queue_url, ReceiptHandle=m['ReceiptHandle'])               
+        else:
+            print('Queue is currently Empty or Messages are Invisible')
+            break
+
+    responseData["body"] = "Messages transferred Successfully " 
+
+  except Exception as e:
+    responseData["status"] = "failure"
+    responseData["errorMessage"] = str(e)
+    
+  return responseData
